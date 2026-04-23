@@ -1,0 +1,67 @@
+name: Generate Go Contracts
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout proto repository
+        uses: actions/checkout@v4
+
+      - name: Checkout generated repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GENERATED_REPOSITORY }}
+          token: ${{ secrets.PROTO_SYNC_TOKEN }}
+          path: generated
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.3"
+
+      - name: Install generators
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
+
+      - name: Generate Go files
+        env:
+          PATH: ${{ env.PATH }}:${{ github.workspace }}/go/bin
+        run: |
+          mkdir -p generated/order/v1 generated/payment/v1
+          protoc \
+            --proto_path=. \
+            --go_out=generated --go_opt=paths=source_relative \
+            --go-grpc_out=generated --go-grpc_opt=paths=source_relative \
+            order/v1/order.proto \
+            payment/v1/payment.proto
+
+      - name: Write go.mod
+        run: |
+          cat > generated/go.mod <<'EOF'
+          module ap2/contracts-generated
+
+          go 1.22
+          EOF
+
+      - name: Commit generated code
+        working-directory: generated
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || git commit -m "chore: regenerate protobuf contracts"
+          git push
