@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package order.v1;
+
+option go_package = "ap2/contracts-generated/order/v1;orderv1";
+
+import "google/protobuf/timestamp.proto";
+
+service OrderService {
+  rpc SubscribeToOrderUpdates(OrderRequest) returns (stream OrderStatusUpdate);
+}
+
+message OrderRequest {
+  string order_id = 1;
+}
+
+message OrderStatusUpdate {
+  string order_id = 1;
+  string customer_id = 2;
+  string item_name = 3;
+  int64 amount = 4;
+  string status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp published_at = 7;
+}
