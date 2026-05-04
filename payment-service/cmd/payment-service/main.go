@@ -8,9 +8,10 @@ import (
 
 func main() {
 	dsn := getEnv("PAYMENT_DB_DSN", "postgres://postgres:postgres@localhost:5433/payment_db?sslmode=disable")
-	addr := getEnv("PAYMENT_GRPC_ADDR", ":9091")
+	addr := getEnv("PAYMENT_GRPC_ADDR", ":50051")
+	amqpURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
-	a, err := app.New(dsn)
+	a, err := app.New(dsn, amqpURL)
 	if err != nil {
 		log.Fatalf("failed to init app: %v", err)
 	}

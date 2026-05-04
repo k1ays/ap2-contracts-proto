@@ -8,11 +8,12 @@ import (
 )
 
 type PaymentUseCase struct {
-	repo PaymentRepository
+	repo      PaymentRepository
+	publisher EventPublisher
 }
 
-func NewPaymentUseCase(repo PaymentRepository) *PaymentUseCase {
-	return &PaymentUseCase{repo: repo}
+func NewPaymentUseCase(repo PaymentRepository, publisher EventPublisher) *PaymentUseCase {
+	return &PaymentUseCase{repo: repo, publisher: publisher}
 }
 
 func (uc *PaymentUseCase) Authorize(req AuthorizeRequest) (*AuthorizeResponse, error) {
@@ -32,6 +33,9 @@ func (uc *PaymentUseCase) Authorize(req AuthorizeRequest) (*AuthorizeResponse, e
 		if saveErr := uc.repo.Save(declined); saveErr != nil {
 			log.Printf("failed to save declined payment for order %s: %v", req.OrderID, saveErr)
 		}
+
+		uc.publishEvent(declined, req.CustomerEmail)
+
 		return &AuthorizeResponse{
 			ID:            declined.ID,
 			OrderID:       declined.OrderID,
@@ -52,6 +56,8 @@ func (uc *PaymentUseCase) Authorize(req AuthorizeRequest) (*AuthorizeResponse, e
 		return nil, fmt.Errorf("failed to save payment: %w", err)
 	}
 
+	uc.publishEvent(payment, req.CustomerEmail)
+
 	return &AuthorizeResponse{
 		ID:            payment.ID,
 		OrderID:       payment.OrderID,
@@ -60,6 +66,25 @@ func (uc *PaymentUseCase) Authorize(req AuthorizeRequest) (*AuthorizeResponse, e
 		Status:        payment.Status,
 		CreatedAt:     payment.CreatedAt,
 	}, nil
+}
+
+func (uc *PaymentUseCase) publishEvent(p *domain.Payment, customerEmail string) {
+	if uc.publisher == nil {
+		return
+	}
+	if customerEmail == "" {
+		customerEmail = "customer@example.com"
+	}
+	event := PaymentCompletedEvent{
+		EventID:       fmt.Sprintf("evt_%s_%d", p.OrderID, time.Now().UnixNano()),
+		OrderID:       p.OrderID,
+		Amount:        p.Amount,
+		CustomerEmail: customerEmail,
+		Status:        p.Status,
+	}
+	if err := uc.publisher.PublishPaymentCompleted(event); err != nil {
+		log.Printf("failed to publish payment event for order %s: %v", p.OrderID, err)
+	}
 }
 
 func (uc *PaymentUseCase) GetByOrderID(orderID string) (*domain.Payment, error) {

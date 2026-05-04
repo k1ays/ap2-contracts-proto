@@ -13,6 +13,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -97,11 +100,20 @@ func (a *App) Run(httpAddr, grpcAddr string) error {
 		errCh <- a.httpServer.ListenAndServe()
 	}()
 
-	err = <-errCh
-	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, grpcpkg.ErrServerStopped) {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-quit:
+		log.Println("Order service shutting down gracefully...")
+		a.Close()
 		return nil
+	case err = <-errCh:
+		if errors.Is(err, http.ErrServerClosed) || errors.Is(err, grpcpkg.ErrServerStopped) {
+			return nil
+		}
+		return err
 	}
-	return err
 }
 
 func (a *App) Close() {

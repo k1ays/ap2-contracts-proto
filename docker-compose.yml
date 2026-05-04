@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   order-db:
     image: postgres:16-alpine
@@ -35,17 +33,36 @@ services:
       timeout: 5s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   payment-service:
     build:
       context: .
       dockerfile: payment-service/Dockerfile
     ports:
-      - "9091:9091"
+      - "50051:50051"
     environment:
       PAYMENT_DB_DSN: postgres://postgres:postgres@payment-db:5432/payment_db?sslmode=disable
-      PAYMENT_GRPC_ADDR: ":9091"
+      PAYMENT_GRPC_ADDR: ":50051"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
       payment-db:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   order-service:
@@ -59,13 +76,24 @@ services:
       ORDER_DB_DSN: postgres://postgres:postgres@order-db:5432/order_db?sslmode=disable
       ORDER_ADDR: ":8080"
       ORDER_GRPC_ADDR: ":9090"
-      PAYMENT_GRPC_ADDR: payment-service:9091
+      PAYMENT_GRPC_ADDR: payment-service:50051
     depends_on:
       order-db:
         condition: service_healthy
       payment-service:
         condition: service_started
 
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
 volumes:
   order-db-data:
   payment-db-data:
+  rabbitmq-data:
