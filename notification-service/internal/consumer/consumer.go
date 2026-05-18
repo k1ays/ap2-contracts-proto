@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,9 +34,10 @@ type Consumer struct {
 
 	maxRetries     int
 	initialBackoff time.Duration
+	workerCount    int
 }
 
-func New(amqpURL, redisAddr string, notifProvider provider.NotificationProvider, maxRetries int, initialBackoff time.Duration) (*Consumer, error) {
+func New(amqpURL, redisAddr string, notifProvider provider.NotificationProvider, maxRetries int, initialBackoff time.Duration, workerCount int) (*Consumer, error) {
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq dial: %w", err)
@@ -89,7 +91,11 @@ func New(amqpURL, redisAddr string, notifProvider provider.NotificationProvider,
 		return nil, fmt.Errorf("bind queue: %w", err)
 	}
 
-	if err := ch.Qos(1, 0, false); err != nil {
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	// Prefetch == workerCount so each worker can hold one unacked message.
+	if err := ch.Qos(workerCount, 0, false); err != nil {
 		ch.Close()
 		conn.Close()
 		return nil, fmt.Errorf("set qos: %w", err)
@@ -106,7 +112,8 @@ func New(amqpURL, redisAddr string, notifProvider provider.NotificationProvider,
 	}
 
 	log.Println("RabbitMQ consumer connected")
-	log.Printf("Notification provider: %T, maxRetries=%d, initialBackoff=%v", notifProvider, maxRetries, initialBackoff)
+	log.Printf("Notification provider: %T, maxRetries=%d, initialBackoff=%v, workerCount=%d",
+		notifProvider, maxRetries, initialBackoff, workerCount)
 
 	return &Consumer{
 		conn:           conn,
@@ -115,6 +122,7 @@ func New(amqpURL, redisAddr string, notifProvider provider.NotificationProvider,
 		provider:       notifProvider,
 		maxRetries:     maxRetries,
 		initialBackoff: initialBackoff,
+		workerCount:    workerCount,
 	}, nil
 }
 
@@ -132,27 +140,39 @@ func (c *Consumer) Start(done <-chan struct{}) error {
 		return fmt.Errorf("consume: %w", err)
 	}
 
-	log.Println("Notification consumer started, waiting for messages...")
+	log.Printf("Notification consumer started with %d workers, waiting for messages...", c.workerCount)
 
-	for {
-		select {
-		case <-done:
-			log.Println("Consumer received shutdown signal")
-			return nil
-		case msg, ok := <-msgs:
-			if !ok {
-				log.Println("Message channel closed")
-				return nil
+	var wg sync.WaitGroup
+	for i := 1; i <= c.workerCount; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			log.Printf("[Worker %d] started", workerID)
+			for {
+				select {
+				case <-done:
+					log.Printf("[Worker %d] shutdown signal received", workerID)
+					return
+				case msg, ok := <-msgs:
+					if !ok {
+						log.Printf("[Worker %d] message channel closed", workerID)
+						return
+					}
+					c.handleMessage(workerID, msg)
+				}
 			}
-			c.handleMessage(msg)
-		}
+		}(i)
 	}
+
+	wg.Wait()
+	log.Println("All notification workers stopped")
+	return nil
 }
 
-func (c *Consumer) handleMessage(msg amqp.Delivery) {
+func (c *Consumer) handleMessage(workerID int, msg amqp.Delivery) {
 	var event domain.PaymentCompletedEvent
 	if err := json.Unmarshal(msg.Body, &event); err != nil {
-		log.Printf("[Notification] Failed to parse message: %v", err)
+		log.Printf("[Worker %d] [Notification] Failed to parse message: %v", workerID, err)
 		msg.Nack(false, false)
 		return
 	}
@@ -166,7 +186,7 @@ func (c *Consumer) handleMessage(msg amqp.Delivery) {
 		log.Printf("[Notification] Redis idempotency check failed: %v", err)
 	}
 	if exists > 0 {
-		log.Printf("[Notification] Duplicate payment_id %s, skipping", event.PaymentID)
+		log.Printf("[Worker %d] [Notification] Duplicate payment_id %s, skipping", workerID, event.PaymentID)
 		msg.Ack(false)
 		return
 	}
@@ -180,8 +200,8 @@ func (c *Consumer) handleMessage(msg amqp.Delivery) {
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := c.initialBackoff * time.Duration(math.Pow(2, float64(attempt-1)))
-			log.Printf("[Notification] Retry %d/%d for payment_id=%s, backoff=%v",
-				attempt, c.maxRetries, event.PaymentID, backoff)
+			log.Printf("[Worker %d] [Notification] Retry %d/%d for payment_id=%s, backoff=%v",
+				workerID, attempt, c.maxRetries, event.PaymentID, backoff)
 			time.Sleep(backoff)
 		}
 
@@ -189,27 +209,27 @@ func (c *Consumer) handleMessage(msg amqp.Delivery) {
 		if sendErr == nil {
 			break
 		}
-		log.Printf("[Notification] Provider error (attempt %d/%d): %v",
-			attempt+1, c.maxRetries+1, sendErr)
+		log.Printf("[Worker %d] [Notification] Provider error (attempt %d/%d): %v",
+			workerID, attempt+1, c.maxRetries+1, sendErr)
 	}
 
 	if sendErr != nil {
-		log.Printf("[Notification] All retries exhausted for payment_id=%s, sending to DLQ: %v",
-			event.PaymentID, sendErr)
+		log.Printf("[Worker %d] [Notification] All retries exhausted for payment_id=%s, sending to DLQ: %v",
+			workerID, event.PaymentID, sendErr)
 		msg.Nack(false, false)
 		return
 	}
 
 	// Mark as processed in Redis (with 24h TTL to prevent memory leaks).
 	if err := c.rdb.Set(ctx, idempotencyKey, "sent", 24*time.Hour).Err(); err != nil {
-		log.Printf("[Notification] Failed to set idempotency key: %v", err)
+		log.Printf("[Worker %d] [Notification] Failed to set idempotency key: %v", workerID, err)
 	}
 
-	log.Printf("[Notification] Successfully sent notification for payment_id=%s order=%s to=%s",
-		event.PaymentID, event.OrderID, event.CustomerEmail)
+	log.Printf("[Worker %d] [Notification] Successfully sent notification for payment_id=%s order=%s to=%s",
+		workerID, event.PaymentID, event.OrderID, event.CustomerEmail)
 
 	if err := msg.Ack(false); err != nil {
-		log.Printf("[Notification] Failed to ACK message: %v", err)
+		log.Printf("[Worker %d] [Notification] Failed to ACK message: %v", workerID, err)
 	}
 }
 

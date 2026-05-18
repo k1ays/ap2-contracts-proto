@@ -116,6 +116,7 @@ services:
       PROVIDER_MODE: ${PROVIDER_MODE}
       MAX_RETRIES: ${MAX_RETRIES}
       INITIAL_BACKOFF: ${INITIAL_BACKOFF}
+      WORKER_COUNT: ${WORKER_COUNT}
     depends_on:
       rabbitmq:
         condition: service_healthy

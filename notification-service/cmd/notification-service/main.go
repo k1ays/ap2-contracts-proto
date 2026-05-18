@@ -16,8 +16,9 @@ func main() {
 	maxRetries := getEnvInt("MAX_RETRIES", 5)
 	initialBackoffSec := getEnvInt("INITIAL_BACKOFF", 2)
 	initialBackoff := time.Duration(initialBackoffSec) * time.Second
+	workerCount := getEnvInt("WORKER_COUNT", 5)
 
-	a, err := app.New(amqpURL, redisAddr, providerMode, maxRetries, initialBackoff)
+	a, err := app.New(amqpURL, redisAddr, providerMode, maxRetries, initialBackoff, workerCount)
 	if err != nil {
 		log.Fatalf("failed to init notification service: %v", err)
 	}

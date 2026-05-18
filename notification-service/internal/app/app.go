@@ -15,7 +15,7 @@ type App struct {
 	consumer *consumer.Consumer
 }
 
-func New(amqpURL, redisAddr, providerMode string, maxRetries int, initialBackoff time.Duration) (*App, error) {
+func New(amqpURL, redisAddr, providerMode string, maxRetries int, initialBackoff time.Duration, workerCount int) (*App, error) {
 	var notifProvider provider.NotificationProvider
 
 	switch providerMode {
@@ -38,7 +38,7 @@ func New(amqpURL, redisAddr, providerMode string, maxRetries int, initialBackoff
 		log.Println("Using SIMULATED notification provider")
 	}
 
-	c, err := consumer.New(amqpURL, redisAddr, notifProvider, maxRetries, initialBackoff)
+	c, err := consumer.New(amqpURL, redisAddr, notifProvider, maxRetries, initialBackoff, workerCount)
 	if err != nil {
 		return nil, fmt.Errorf("create consumer: %w", err)
 	}
