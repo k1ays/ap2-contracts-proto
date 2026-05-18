@@ -4,16 +4,19 @@ import (
 	"ap2/order-service/internal/domain"
 	"context"
 	"fmt"
+	"log"
+
 	"github.com/google/uuid"
 )
 
 type OrderUseCase struct {
 	repo    OrderRepository
 	payment PaymentClient
+	cache   OrderCache
 }
 
-func NewOrderUseCase(repo OrderRepository, payment PaymentClient) *OrderUseCase {
-	return &OrderUseCase{repo: repo, payment: payment}
+func NewOrderUseCase(repo OrderRepository, payment PaymentClient, cache OrderCache) *OrderUseCase {
+	return &OrderUseCase{repo: repo, payment: payment, cache: cache}
 }
 
 // CreateOrder creates a Pending order, calls Payment Service, then updates status.
@@ -24,15 +27,12 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, customerID, itemName st
 	}
 	order.ID = generateID()
 
-	// Persist as Pending first.
 	if err := uc.repo.Save(order); err != nil {
 		return nil, fmt.Errorf("save order: %w", err)
 	}
 
-	// Call Payment Service (timeout is enforced by the HTTP client).
 	_, status, err := uc.payment.Authorize(ctx, order.ID, order.Amount)
 	if err != nil {
-		// Payment Service unavailable — mark as Failed, return 503 to caller.
 		order.MarkFailed()
 		_ = uc.repo.Update(order)
 		return nil, ErrPaymentServiceUnavailable
@@ -47,14 +47,46 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, customerID, itemName st
 	if err := uc.repo.Update(order); err != nil {
 		return nil, fmt.Errorf("update order status: %w", err)
 	}
+
+	// Invalidate cache after status change.
+	if uc.cache != nil {
+		if err := uc.cache.Invalidate(ctx, order.ID); err != nil {
+			log.Printf("[Cache] failed to invalidate order %s: %v", order.ID, err)
+		}
+	}
+
 	return order, nil
 }
 
-func (uc *OrderUseCase) GetOrder(id string) (*domain.Order, error) {
-	return uc.repo.FindByID(id)
+// GetOrder uses cache-aside: check cache first, fallback to DB, then populate cache.
+func (uc *OrderUseCase) GetOrder(ctx context.Context, id string) (*domain.Order, error) {
+	if uc.cache != nil {
+		cached, err := uc.cache.Get(ctx, id)
+		if err != nil {
+			log.Printf("[Cache] failed to get order %s: %v", id, err)
+		}
+		if cached != nil {
+			log.Printf("[Cache] HIT for order %s", id)
+			return cached, nil
+		}
+		log.Printf("[Cache] MISS for order %s", id)
+	}
+
+	order, err := uc.repo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	if uc.cache != nil {
+		if err := uc.cache.Set(ctx, order); err != nil {
+			log.Printf("[Cache] failed to set order %s: %v", id, err)
+		}
+	}
+
+	return order, nil
 }
 
-func (uc *OrderUseCase) CancelOrder(id string) (*domain.Order, error) {
+func (uc *OrderUseCase) CancelOrder(ctx context.Context, id string) (*domain.Order, error) {
 	order, err := uc.repo.FindByID(id)
 	if err != nil {
 		return nil, err
@@ -65,6 +97,14 @@ func (uc *OrderUseCase) CancelOrder(id string) (*domain.Order, error) {
 	if err := uc.repo.Update(order); err != nil {
 		return nil, fmt.Errorf("update order: %w", err)
 	}
+
+	// Invalidate cache after status change.
+	if uc.cache != nil {
+		if err := uc.cache.Invalidate(ctx, order.ID); err != nil {
+			log.Printf("[Cache] failed to invalidate order %s: %v", order.ID, err)
+		}
+	}
+
 	return order, nil
 }
 
@@ -72,7 +112,6 @@ func (uc *OrderUseCase) ListOrders(status string) ([]*domain.Order, error) {
 	return uc.repo.FindByStatus(status)
 }
 
-// Sentinel error returned when Payment Service is unreachable.
 var ErrPaymentServiceUnavailable = fmt.Errorf("payment service unavailable")
 
 func generateID() string {

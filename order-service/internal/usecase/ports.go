@@ -17,3 +17,10 @@ type OrderRepository interface {
 type PaymentClient interface {
 	Authorize(ctx context.Context, orderID string, amount int64) (string, string, error)
 }
+
+// OrderCache is the port for caching order data.
+type OrderCache interface {
+	Get(ctx context.Context, id string) (*domain.Order, error)
+	Set(ctx context.Context, order *domain.Order) error
+	Invalidate(ctx context.Context, id string) error
+}

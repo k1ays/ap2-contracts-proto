@@ -1,6 +1,7 @@
 services:
   order-db:
     image: postgres:16-alpine
+    env_file: .env
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -18,6 +19,7 @@ services:
 
   payment-db:
     image: postgres:16-alpine
+    env_file: .env
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -29,6 +31,18 @@ services:
       - ./payment-service/migrations:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d payment_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -53,6 +67,7 @@ services:
     build:
       context: .
       dockerfile: payment-service/Dockerfile
+    env_file: .env
     ports:
       - "50051:50051"
     environment:
@@ -69,6 +84,7 @@ services:
     build:
       context: .
       dockerfile: order-service/Dockerfile
+    env_file: .env
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -77,23 +93,37 @@ services:
       ORDER_ADDR: ":8080"
       ORDER_GRPC_ADDR: ":9090"
       PAYMENT_GRPC_ADDR: payment-service:50051
+      REDIS_ADDR: redis:6379
+      CACHE_TTL: ${CACHE_TTL}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW}
     depends_on:
       order-db:
         condition: service_healthy
       payment-service:
         condition: service_started
+      redis:
+        condition: service_healthy
 
   notification-service:
     build:
       context: .
       dockerfile: notification-service/Dockerfile
+    env_file: .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_ADDR: redis:6379
+      PROVIDER_MODE: ${PROVIDER_MODE}
+      MAX_RETRIES: ${MAX_RETRIES}
+      INITIAL_BACKOFF: ${INITIAL_BACKOFF}
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:
   order-db-data:
   payment-db-data:
   rabbitmq-data:
+  redis-data:

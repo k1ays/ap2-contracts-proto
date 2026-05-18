@@ -32,7 +32,7 @@ func (s *OrderServer) SubscribeToOrderUpdates(
 		return status.Error(codes.InvalidArgument, "order_id is required")
 	}
 
-	order, err := s.uc.GetOrder(req.GetOrderId())
+	order, err := s.uc.GetOrder(stream.Context(), req.GetOrderId())
 	if err == domain.ErrOrderNotFound {
 		return status.Error(codes.NotFound, "order not found")
 	}
