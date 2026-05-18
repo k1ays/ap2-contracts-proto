@@ -13,8 +13,10 @@ type MockProvider struct {
 	failRate float64
 }
 
+// NewMockProvider creates a mock with an 80% failure rate (20% success rate).
+// The high failure rate makes retry chains and DLQ behavior easy to demonstrate.
 func NewMockProvider() *MockProvider {
-	return &MockProvider{failRate: 0.3}
+	return &MockProvider{failRate: 0.8}
 }
 
 func (m *MockProvider) Send(to, subject, body string) error {
