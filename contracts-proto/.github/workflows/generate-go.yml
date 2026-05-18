@@ -38,9 +38,8 @@ jobs:
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
 
       - name: Generate Go files
-        env:
-          PATH: ${{ env.PATH }}:${{ github.workspace }}/go/bin
         run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
           mkdir -p generated/order/v1 generated/payment/v1
           protoc \
             --proto_path=. \

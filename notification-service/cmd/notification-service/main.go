@@ -4,12 +4,20 @@ import (
 	"ap2/notification-service/internal/app"
 	"log"
 	"os"
+	"strconv"
+	"time"
 )
 
 func main() {
 	amqpURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	providerMode := getEnv("PROVIDER_MODE", "SIMULATED")
 
-	a, err := app.New(amqpURL)
+	maxRetries := getEnvInt("MAX_RETRIES", 5)
+	initialBackoffSec := getEnvInt("INITIAL_BACKOFF", 2)
+	initialBackoff := time.Duration(initialBackoffSec) * time.Second
+
+	a, err := app.New(amqpURL, redisAddr, providerMode, maxRetries, initialBackoff)
 	if err != nil {
 		log.Fatalf("failed to init notification service: %v", err)
 	}
@@ -24,6 +32,15 @@ func main() {
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
 	}
 	return fallback
 }

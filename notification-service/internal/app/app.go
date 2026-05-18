@@ -2,19 +2,43 @@ package app
 
 import (
 	"ap2/notification-service/internal/consumer"
+	"ap2/notification-service/internal/provider"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 type App struct {
 	consumer *consumer.Consumer
 }
 
-func New(amqpURL string) (*App, error) {
-	c, err := consumer.New(amqpURL)
+func New(amqpURL, redisAddr, providerMode string, maxRetries int, initialBackoff time.Duration) (*App, error) {
+	var notifProvider provider.NotificationProvider
+
+	switch providerMode {
+	case "REAL":
+		smtpHost := os.Getenv("SMTP_HOST")
+		smtpPort := os.Getenv("SMTP_PORT")
+		smtpUser := os.Getenv("SMTP_USER")
+		smtpPass := os.Getenv("SMTP_PASS")
+		smtpFrom := os.Getenv("SMTP_FROM")
+		if smtpHost == "" {
+			smtpHost = "localhost"
+		}
+		if smtpPort == "" {
+			smtpPort = "587"
+		}
+		notifProvider = provider.NewSMTPProvider(smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom)
+		log.Println("Using REAL (SMTP) notification provider")
+	default:
+		notifProvider = provider.NewMockProvider()
+		log.Println("Using SIMULATED notification provider")
+	}
+
+	c, err := consumer.New(amqpURL, redisAddr, notifProvider, maxRetries, initialBackoff)
 	if err != nil {
 		return nil, fmt.Errorf("create consumer: %w", err)
 	}

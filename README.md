@@ -1,144 +1,199 @@
-# AP2 Assignment 3 - Event-Driven Architecture with Message Queues
+# AP2 Assignment 4 — Performance Optimization & External Integrations
 
-This project extends Assignments 1 & 2 by introducing an **Event-Driven Architecture (EDA)** using **RabbitMQ** as the message broker. A new **Notification Service** consumes payment events asynchronously, fully decoupled from the Payment and Order services.
+This project extends Assignments 1–3 by adding **Redis Caching**, **Background Job reliability**, and **External Provider Adapters** to the microservices system.
 
-## What Changed (Assignment 3)
+## What Changed (Assignment 4)
 
-- **RabbitMQ** added as the message broker.
-- **Payment Service** now acts as a **Producer**: after a successful DB transaction, it publishes a `payment.completed` event to RabbitMQ.
-- **Notification Service** (new) acts as a **Consumer**: listens to the `payment.completed` queue, simulates sending email notifications.
-- **Manual ACKs**: auto-ack is disabled; messages are acknowledged only after successful processing.
-- **Durable Queues**: queues and messages are persistent and survive broker restarts.
-- **Idempotency**: in-memory store tracks processed event IDs to prevent duplicate notifications.
-- **Graceful Shutdown**: all three services handle `SIGINT`/`SIGTERM` via `os/signal` for clean resource cleanup.
-- **Dead Letter Queue (DLQ)**: messages that fail processing after 3 retries or cannot be parsed are routed to a Dead Letter Queue (`payment.completed.dlq`).
+- **Redis Cache** added to Order Service (cache-aside pattern for `GET /orders/:id`).
+- **Cache Invalidation**: cache is deleted immediately after any DB status update (create, cancel).
+- **Notification Provider Adapter**: `NotificationProvider` interface with two implementations — `MockProvider` (simulated) and `SMTPProvider` (real SMTP).
+- **Provider selection via env**: `PROVIDER_MODE=SIMULATED` or `PROVIDER_MODE=REAL`.
+- **Redis-based Idempotency**: replaced in-memory map with Redis keys (`notification:processed:<payment_id>`) with 24h TTL.
+- **Exponential Backoff Retries**: configurable retry policy with formula `backoff = INITIAL_BACKOFF * 2^(attempt-1)`.
+- **API Rate Limiter (Bonus)**: Redis-based per-IP rate limiting middleware returning HTTP 429.
+- **`.env` file**: all configuration (TTL, retry counts, API keys) in a single `.env` file.
 
 ## Architecture
 
 ```text
 Client (curl/Postman)
         |
-        | REST :8080
+        | REST :8080 (Rate Limiter middleware)
         v
 Order Service
   - Gin REST API
+  - Redis Cache (cache-aside, TTL=5min)
   - gRPC client -> Payment Service :50051
   - gRPC streaming server :9090
   - PostgreSQL order_db
-  - LISTEN/NOTIFY subscriber for order status changes
+  - Cache invalidation on status change
         |
         | gRPC
         v
 Payment Service (Producer)
   - gRPC server :50051
-  - Unary interceptor (method + duration logging)
   - PostgreSQL payment_db
   - Publishes payment.completed events to RabbitMQ
         |
         | AMQP (RabbitMQ)
         v
-  [payment.events exchange] --routing_key:payment.completed--> [payment.completed queue]
-        |                                                             |
-        |                                           [payment.events.dlx] (Dead Letter Exchange)
-        |                                                             |
-        |                                           [payment.completed.dlq] (Dead Letter Queue)
+  [payment.events exchange] --> [payment.completed queue]
+        |                              |
+        |                   [payment.events.dlx] (DLX)
+        |                              |
+        |                   [payment.completed.dlq] (DLQ)
         v
-Notification Service (Consumer)
+Notification Service (Background Worker)
   - Listens to payment.completed queue
-  - Manual ACKs (no auto-ack)
-  - Idempotent consumer (in-memory event ID tracking)
-  - Logs simulated email notifications
-  - Graceful shutdown via os/signal
+  - NotificationProvider adapter (Mock / SMTP)
+  - Exponential backoff retries (2s, 4s, 8s, 16s...)
+  - Redis-based idempotency (prevents duplicate sends)
+  - Manual ACKs, DLQ on exhausted retries
 ```
 
-## Event Payload (JSON)
+## 1. Caching Strategy (Order Service)
 
-```json
-{
-  "event_id": "evt_order123_1714500000000000000",
-  "order_id": "order123",
-  "amount": 50000,
-  "customer_email": "customer@example.com",
-  "status": "Authorized"
+### Cache-Aside Pattern
+
+- **Read Path (`GET /orders/:id`):**
+  1. Check Redis for key `order:<id>`.
+  2. **Cache HIT** → return cached data (no DB query).
+  3. **Cache MISS** → query PostgreSQL, store in Redis with TTL, return data.
+
+- **TTL**: Configurable via `CACHE_TTL` env var (default: 300s = 5 minutes).
+
+### Cache Invalidation
+
+**Atomic invalidation** — cache key is deleted immediately after any DB update:
+
+- After `CreateOrder`: when status changes to `Paid`/`Failed`, key `order:<id>` is deleted.
+- After `CancelOrder`: key `order:<id>` is deleted.
+- **Delete over update**: avoids race conditions; next read repopulates from DB.
+
+This ensures stale data (e.g., "Pending" for a paid order) is never served.
+
+## 2. External Provider Adapter (Notification Service)
+
+### Adapter Pattern
+
+```go
+type NotificationProvider interface {
+    Send(to, subject, body string) error
 }
 ```
 
-## Idempotency Strategy
+| Provider       | Description                                                                 |
+|----------------|-----------------------------------------------------------------------------|
+| `MockProvider` | Simulates latency (100–500ms) and 30% random failures for testing retries. |
+| `SMTPProvider` | Real SMTP email delivery (requires SMTP_HOST, SMTP_PORT, etc.).            |
 
-The Notification Service uses an **in-memory map** (`map[string]struct{}`) protected by a `sync.RWMutex` to track processed `event_id` values. Before processing any message:
+### Configuration
 
-1. The consumer checks if the `event_id` has already been processed.
-2. If yes, it immediately ACKs the message without re-sending the notification (duplicate suppression).
-3. If no, it processes the message, marks the `event_id` as processed, then ACKs.
+`PROVIDER_MODE` env var:
+- `SIMULATED` (default) — MockProvider
+- `REAL` — SMTPProvider
 
-This ensures that even if the same message is delivered multiple times (at-least-once delivery), the notification log is printed only once per unique event.
+## 3. Retry Logic & Idempotency
 
-## ACK Logic Implementation
+### Exponential Backoff
 
-- **Auto-ACK is disabled**: the consumer is created with `autoAck: false`.
-- Messages are acknowledged (`msg.Ack(false)`) **only after** the notification log is successfully printed and the event is marked as processed.
-- If a message cannot be parsed (invalid JSON), it is **rejected** (`msg.Nack(false, false)`) and routed to the DLQ.
-- If the consumer crashes mid-processing, the unacknowledged message remains in the queue and is redelivered.
+```
+Attempt 1: immediate
+Attempt 2: wait 2s
+Attempt 3: wait 4s
+Attempt 4: wait 8s
+Attempt 5: wait 16s
+```
 
-## Dead Letter Queue (DLQ) - Bonus
+Formula: `backoff = INITIAL_BACKOFF * 2^(attempt-1)`
 
-The system implements a Dead Letter Queue for advanced failure handling:
+If all retries exhausted → message NACKed → sent to DLQ.
 
-- **DLX Exchange**: `payment.events.dlx` (direct exchange)
-- **DLQ**: `payment.completed.dlq`
-- Messages are sent to the DLQ when:
-  - JSON parsing fails (malformed messages)
-  - Processing fails after **3 retry attempts** (checked via `x-death` headers)
-- The main queue (`payment.completed`) is configured with `x-dead-letter-exchange` and `x-dead-letter-routing-key` arguments.
+### Redis Idempotency
+
+Before processing, check Redis key `notification:processed:<payment_id>`:
+1. Key **exists** → duplicate, ACK and skip.
+2. Key **does not exist** → send notification.
+3. After success → set key with 24h TTL.
+
+Prevents duplicate emails on message retry.
+
+## 4. API Rate Limiter (Bonus +10%)
+
+Redis-based per-IP rate limiting:
+- Key: `rate_limit:<ip>`, counter incremented per request.
+- Configurable: `RATE_LIMIT_MAX` (default: 10), `RATE_LIMIT_WINDOW` (default: 60s).
+- Returns HTTP 429 with `Retry-After` header when exceeded.
+- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`.
 
 ## Project Structure
 
 ```text
-ap2_assignment1/
-  contracts-proto/
-  contracts-generated/
-  order-service/
-    cmd/order-service/
-    cmd/order-updates-client/
-    internal/domain/
-    internal/usecase/
-    internal/repository/
-    internal/transport/http/
-    internal/transport/grpc/
-    migrations/
-  payment-service/
-    cmd/payment-service/
-    internal/domain/
-    internal/usecase/
-    internal/repository/
-    internal/transport/grpc/
-    internal/infrastructure/rabbitmq/   <- NEW: RabbitMQ publisher
-    migrations/
-  notification-service/                  <- NEW SERVICE
-    cmd/notification-service/
-    internal/app/
-    internal/consumer/
-    internal/domain/
+├── contracts-proto/
+├── contracts-generated/
+├── order-service/
+│   ├── cmd/order-service/
+│   ├── cmd/order-updates-client/
+│   ├── internal/domain/
+│   ├── internal/usecase/
+│   ├── internal/repository/
+│   ├── internal/transport/http/
+│   ├── internal/transport/grpc/
+│   ├── internal/infrastructure/redis/    ← NEW: cache + rate limiter
+│   └── migrations/
+├── payment-service/
+│   ├── cmd/payment-service/
+│   ├── internal/domain/
+│   ├── internal/usecase/
+│   ├── internal/repository/
+│   ├── internal/transport/grpc/
+│   ├── internal/infrastructure/rabbitmq/
+│   └── migrations/
+├── notification-service/
+│   ├── cmd/notification-service/
+│   ├── internal/app/
+│   ├── internal/consumer/                ← UPDATED: Redis idempotency + backoff
+│   ├── internal/domain/
+│   └── internal/provider/               ← NEW: adapter pattern
+├── docker-compose.yml
+├── .env
+└── README.md
 ```
 
 ## Environment Variables
 
+All configuration is in `.env`:
+
 ### Order Service
 
-- `ORDER_DB_DSN` - PostgreSQL DSN for `order_db`
-- `ORDER_ADDR` - REST address, default `:8080`
-- `ORDER_GRPC_ADDR` - gRPC streaming server address, default `:9090`
-- `PAYMENT_GRPC_ADDR` - payment gRPC server address, default `localhost:50051`
+| Variable           | Default              | Description                        |
+|--------------------|----------------------|------------------------------------|
+| `ORDER_DB_DSN`     | postgres://...       | PostgreSQL DSN for order_db        |
+| `ORDER_ADDR`       | :8080                | REST address                       |
+| `ORDER_GRPC_ADDR`  | :9090                | gRPC streaming server address      |
+| `PAYMENT_GRPC_ADDR`| payment-service:50051| Payment gRPC address               |
+| `REDIS_ADDR`       | redis:6379           | Redis address                      |
+| `CACHE_TTL`        | 300                  | Cache TTL in seconds               |
+| `RATE_LIMIT_MAX`   | 10                   | Max requests per window            |
+| `RATE_LIMIT_WINDOW`| 60                   | Rate limit window in seconds       |
 
 ### Payment Service
 
-- `PAYMENT_DB_DSN` - PostgreSQL DSN for `payment_db`
-- `PAYMENT_GRPC_ADDR` - gRPC server address, default `:50051`
-- `RABBITMQ_URL` - RabbitMQ connection URL, default `amqp://guest:guest@localhost:5672/`
+| Variable           | Default              | Description                        |
+|--------------------|----------------------|------------------------------------|
+| `PAYMENT_DB_DSN`   | postgres://...       | PostgreSQL DSN for payment_db      |
+| `PAYMENT_GRPC_ADDR`| :50051               | gRPC server address                |
+| `RABBITMQ_URL`     | amqp://...           | RabbitMQ connection URL            |
 
 ### Notification Service
 
-- `RABBITMQ_URL` - RabbitMQ connection URL, default `amqp://guest:guest@localhost:5672/`
+| Variable           | Default              | Description                        |
+|--------------------|----------------------|------------------------------------|
+| `RABBITMQ_URL`     | amqp://...           | RabbitMQ connection URL            |
+| `REDIS_ADDR`       | redis:6379           | Redis address for idempotency      |
+| `PROVIDER_MODE`    | SIMULATED            | Provider mode (SIMULATED/REAL)     |
+| `MAX_RETRIES`      | 5                    | Max retry attempts                 |
+| `INITIAL_BACKOFF`  | 2                    | Initial backoff in seconds         |
 
 ## Running With Docker
 
@@ -149,42 +204,15 @@ docker compose up --build
 
 Services:
 
-- `order-db` -> `localhost:5432`
-- `payment-db` -> `localhost:5433`
-- `rabbitmq` -> `localhost:5672` (AMQP), `localhost:15672` (Management UI, guest/guest)
-- `order-service` REST -> `localhost:8080`
-- `order-service` gRPC stream -> `localhost:9090`
-- `payment-service` gRPC -> `localhost:50051`
-- `notification-service` (no exposed ports, consumes from RabbitMQ)
-
-## Running Without Docker
-
-If Go is installed locally:
-
-```bash
-# Terminal 1 - Start RabbitMQ
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management-alpine
-
-# Terminal 2
-cd payment-service
-PAYMENT_DB_DSN="postgres://postgres:postgres@localhost:5433/payment_db?sslmode=disable" \
-PAYMENT_GRPC_ADDR=":50051" \
-RABBITMQ_URL="amqp://guest:guest@localhost:5672/" \
-go run ./cmd/payment-service
-
-# Terminal 3
-cd order-service
-ORDER_DB_DSN="postgres://postgres:postgres@localhost:5432/order_db?sslmode=disable" \
-ORDER_ADDR=":8080" \
-ORDER_GRPC_ADDR=":9090" \
-PAYMENT_GRPC_ADDR="localhost:50051" \
-go run ./cmd/order-service
-
-# Terminal 4
-cd notification-service
-RABBITMQ_URL="amqp://guest:guest@localhost:5672/" \
-go run ./cmd/notification-service
-```
+| Service                | Port(s)       | Description                          |
+|------------------------|---------------|--------------------------------------|
+| `order-db`             | 5432          | PostgreSQL for orders                |
+| `payment-db`           | 5433          | PostgreSQL for payments              |
+| `redis`                | 6379          | Cache, rate limiting, idempotency    |
+| `rabbitmq`             | 5672, 15672   | Message broker                       |
+| `order-service`        | 8080, 9090    | REST + gRPC API                      |
+| `payment-service`      | 50051         | gRPC payment processing              |
+| `notification-service` | —             | Background worker                    |
 
 ## REST API Examples
 
@@ -196,31 +224,19 @@ curl -X POST http://localhost:8080/orders \
   -d '{"customer_id":"cust_001","item_name":"Laptop","amount":50000}'
 ```
 
-Expected console output from Notification Service:
-```
-[Notification] Sent email to customer@example.com for Order #<order_id>. Amount: $500.00. Status: Authorized
-```
-
-### Create Declined Order
-
-```bash
-curl -X POST http://localhost:8080/orders \
-  -H "Content-Type: application/json" \
-  -d '{"customer_id":"cust_002","item_name":"Supercar","amount":200000}'
-```
-
-The order is created but declined (amount exceeds limit). A notification event is still published with status `Declined`.
-
-### Get Order
+### Get Order (with caching)
 
 ```bash
 curl http://localhost:8080/orders/<id>
+# First call: Cache MISS → DB query → cached
+# Second call: Cache HIT → returned from Redis
 ```
 
 ### Cancel Order
 
 ```bash
 curl -X PATCH http://localhost:8080/orders/<id>/cancel
+# Cache invalidated after cancellation
 ```
 
 ### List Orders
@@ -232,20 +248,17 @@ curl "http://localhost:8080/orders?status=Paid"
 
 ## Graceful Shutdown
 
-All three services intercept `SIGINT` and `SIGTERM` signals using `os/signal`:
+All services intercept `SIGINT`/`SIGTERM`:
 
-- **Order Service**: shuts down HTTP server with timeout, stops gRPC server gracefully, closes DB and gRPC connections.
-- **Payment Service**: stops gRPC server gracefully, closes RabbitMQ publisher connection, closes DB.
-- **Notification Service**: signals the consumer loop to stop, closes RabbitMQ connection.
+- **Order Service**: shuts down HTTP server, stops gRPC, closes Redis + DB connections.
+- **Payment Service**: stops gRPC, closes RabbitMQ publisher, closes DB.
+- **Notification Service**: stops consumer loop, closes RabbitMQ + Redis connections.
 
 ## Contract-First Workspace
 
-`contracts-proto/` simulates the dedicated proto repository required by the assignment.
-
 - `contracts-proto/payment/v1/payment.proto`
 - `contracts-proto/order/v1/order.proto`
-
-`contracts-generated/` contains the generated Go code consumed by both services through local `replace` directives.
+- `contracts-generated/` — generated Go code via local `replace` directives.
 
 ## Repository Links
 

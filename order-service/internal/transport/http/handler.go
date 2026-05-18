@@ -54,7 +54,7 @@ func (h *OrderHandler) CreateOrder(c *gin.Context) {
 }
 
 func (h *OrderHandler) GetOrder(c *gin.Context) {
-	order, err := h.uc.GetOrder(c.Param("id"))
+	order, err := h.uc.GetOrder(c.Request.Context(), c.Param("id"))
 	if err == domain.ErrOrderNotFound {
 		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
 		return
@@ -67,7 +67,7 @@ func (h *OrderHandler) GetOrder(c *gin.Context) {
 }
 
 func (h *OrderHandler) CancelOrder(c *gin.Context) {
-	order, err := h.uc.CancelOrder(c.Param("id"))
+	order, err := h.uc.CancelOrder(c.Request.Context(), c.Param("id"))
 	if err == domain.ErrOrderNotFound {
 		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
 		return
